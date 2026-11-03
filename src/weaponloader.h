@@ -1,0 +1,66 @@
+#ifndef WEAPONLOADER_H
+#define WEAPONLOADER_H
+
+#include <QObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QJsonArray>
+#include <QTimer>
+#include <QList>
+#include <QElapsedTimer>
+#include <functional>
+
+class WeaponLoader : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit WeaponLoader(QObject *parent = nullptr,
+                          QNetworkAccessManager *networkManager = nullptr,
+                          int requestTimeoutMs = 15000, int refreshTimeoutMs = 10000);
+
+    void loadWeapons(std::function<void(const QJsonArray&)> callback,
+                     int maxRetries = 3);
+
+    static bool hasCurrentAntiChampionSchema(const QJsonArray &weapons);
+    
+    // QML-callable reload method
+    Q_INVOKABLE void reload();
+
+signals:
+    void weaponsLoaded(const QJsonArray &weapons);
+    void loadFailed(const QString &message);
+    void loadStatusChanged(const QString &message);
+    void reloadStarted();
+    void reloadFinished(bool updated);
+
+private slots:
+    void onNetworkReply(QNetworkReply *reply);
+    void onTimeout();
+
+private:
+    void startRequest();
+    void cleanupCurrentRequest();
+    void failRequest(const QString &message);
+    QNetworkAccessManager *m_networkManager;
+    std::function<void(const QJsonArray&)> m_callback;
+    QNetworkReply *m_currentReply;
+    QTimer *m_timeoutTimer;
+    int m_retryCount;
+    int m_maxRetries;
+    bool m_forceFreshRequest = false;
+    bool m_schemaRefreshAttempted = false;
+    bool m_reloading = false;
+    QElapsedTimer m_refreshElapsed;
+    int m_requestTimeoutMs;
+    int m_refreshTimeoutMs;
+    static const int MAX_RETRIES = 3;
+
+    // F5 spam protection: max 3 reloads per 60 seconds
+    QJsonArray m_cachedWeapons;
+    QList<qint64> m_reloadTimestamps;
+    static const int RELOAD_WINDOW_SECS = 60;
+    static const int MAX_RELOADS_PER_WINDOW = 3;
+};
+
+#endif // WEAPONLOADER_H

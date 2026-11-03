@@ -1,0 +1,259 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'qml/**'
+      - 'resources/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-release.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_current:
+        description: 'Publish the version already set in CMakeLists.txt'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.repository }}-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  QT_VERSION: '6.8.1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Verify release identity
+      if: github.event_name == 'push' || inputs.release_current == true
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GODROLLDEV_RELEASE_TOKEN }}
+      run: |
+        if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+          throw "Set GODROLLDEV_RELEASE_TOKEN to a token owned by godrolldev before publishing."
+        }
+        $login = gh api user --jq '.login'
+        if ($LASTEXITCODE -ne 0 -or $login -ne 'godrolldev') {
+          throw "The release token must belong to godrolldev."
+        }
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ (github.event_name == 'push' || inputs.release_current == true) && secrets.GODROLLDEV_RELEASE_TOKEN || github.token }}
+
+    - name: Get current version
+      id: get_version
+      shell: pwsh
+      run: |
+        $content = Get-Content "CMakeLists.txt" -Raw
+        if ($content -match 'project\(GodrollLauncher VERSION (\d+)\.(\d+)\.(\d+)') {
+          $major = $matches[1]
+          $minor = $matches[2]
+          $patch = $matches[3]
+          echo "CURRENT_VERSION=$major.$minor.$patch" >> $env:GITHUB_OUTPUT
+          echo "MAJOR=$major" >> $env:GITHUB_OUTPUT
+          echo "MINOR=$minor" >> $env:GITHUB_OUTPUT
+          echo "PATCH=$patch" >> $env:GITHUB_OUTPUT
+        }
+
+    - name: Determine next version
+      id: new_version
+      shell: pwsh
+      run: |
+        if ("${{ inputs.release_current }}" -eq "true") {
+          echo "NEW_VERSION=${{ steps.get_version.outputs.CURRENT_VERSION }}" >> $env:GITHUB_OUTPUT
+          exit 0
+        }
+        $major = [int]"${{ steps.get_version.outputs.MAJOR }}"
+        $minor = [int]"${{ steps.get_version.outputs.MINOR }}"
+        $patch = [int]"${{ steps.get_version.outputs.PATCH }}"
+        $commitMessage = git log -1 --pretty=%B
+
+        if ($commitMessage -match '(?m)^BREAKING CHANGE:' -or
+            $commitMessage -match '^[a-z]+(\([^)]+\))?!:') {
+          $major++
+          $minor = 0
+          $patch = 0
+        } elseif ($commitMessage -match '^feat(\([^)]+\))?:') {
+          $minor++
+          $patch = 0
+        } else {
+          $patch++
+        }
+
+        $newVersion = "$major.$minor.$patch"
+        echo "NEW_VERSION=$newVersion" >> $env:GITHUB_OUTPUT
+        echo "New version: $newVersion"
+
+    - name: Update version in CMakeLists.txt
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      shell: pwsh
+      run: |
+        $content = Get-Content "CMakeLists.txt" -Raw
+        $newVersion = "${{ steps.new_version.outputs.NEW_VERSION }}"
+        $content = $content -replace 'project\(GodrollLauncher VERSION \d+\.\d+\.\d+', "project(GodrollLauncher VERSION $newVersion"
+        Set-Content "CMakeLists.txt" $content -NoNewline
+        
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ env.QT_VERSION }}
+        host: 'windows'
+        target: 'desktop'
+        arch: 'win64_mingw'
+        modules: 'qtnetworkauth'
+        tools: 'tools_mingw1310'
+
+    - name: Configure CMake
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path build
+        cd build
+        cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      shell: pwsh
+      run: |
+        cd build
+        mingw32-make -j4
+
+    - name: Deploy Qt dependencies
+      shell: pwsh
+      run: |
+        cd build
+        New-Item -ItemType Directory -Force -Path deploy
+        Copy-Item "GodrollLauncher.exe" -Destination "deploy/"
+        cd deploy
+        windeployqt --release --compiler-runtime --qmldir ../../qml GodrollLauncher.exe
+
+    - name: Test
+      shell: pwsh
+      run: ctest --test-dir build --output-on-failure
+        
+    - name: Clean unnecessary files
+      shell: pwsh
+      run: |
+        cd build/deploy
+        # Remove unnecessary DLLs to reduce size
+        Remove-Item "opengl32sw.dll" -ErrorAction SilentlyContinue
+        Remove-Item "d3dcompiler_47.dll" -ErrorAction SilentlyContinue
+
+    - name: Create ZIP archive
+      shell: pwsh
+      run: |
+        $version = "${{ steps.new_version.outputs.NEW_VERSION }}"
+        $zipPath = "GodrollLauncher-v$version.zip"
+        Compress-Archive -Path "build/deploy/*" -DestinationPath $zipPath
+        $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $checksum = "$hash  $(Split-Path $zipPath -Leaf)`n"
+        [System.IO.File]::WriteAllText("$zipPath.sha256", $checksum, [System.Text.UTF8Encoding]::new($false))
+
+    - name: Commit version update
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      shell: pwsh
+      run: |
+        git config --local user.email "351728135+godrolldev@users.noreply.github.com"
+        git config --local user.name "godrolldev"
+        git add CMakeLists.txt
+        git diff --staged --quiet || git commit -m "chore(release): v${{ steps.new_version.outputs.NEW_VERSION }} [skip ci]"
+        git push
+
+    - name: Create Release
+      if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || inputs.release_current == true
+      uses: softprops/action-gh-release@v2
+      with:
+        token: ${{ secrets.GODROLLDEV_RELEASE_TOKEN }}
+        target_commitish: ${{ github.event_name == 'push' && 'main' || github.sha }}
+        tag_name: v${{ steps.new_version.outputs.NEW_VERSION }}
+        name: Godroll Launcher v${{ steps.new_version.outputs.NEW_VERSION }}
+        body: |
+          ## Godroll Launcher v${{ steps.new_version.outputs.NEW_VERSION }}
+
+          ### Changes in This Version
+          - Update checks now show clear error messages with an option to try again
+          - Weapon refreshes keep your last loaded data when the connection is slow or unavailable
+          
+          ### Search Features
+          - Anti-Champion types do not affect weapon ordering
+          - Use `-b` with any starting part of a Champion type, such as `-b b`, `-b ove`, or `-b uns`, to filter weapons
+          - **Flag modifiers**: `-!` (unique), `-*` (all), `-h` (holofoil), `-a` (adept), `-e` (exotic), `-c` (craftable)
+          - **Source filter**: `-s <source>` to filter by raid/dungeon/activity (e.g., `-s se` for Salvation's Edge)
+          - **Trait filter**: `-t <trait>` searches both perks and origin traits
+          - **Ammo and slot search**: Search by ammo type (`primary`, `special`, `heavy`) and equipment slot (`kinetic`, `energy`, `power`)
+          - **RPM search**: Exact 2-4 digit RPM values combine with other terms without blocking numeric weapon-name matches
+          - **Combined query example**: `primary 140 solar hc -c`
+          - **Exact source matching**: Exact source matches take priority over partial matches
+          - **Filter flags search all**: Using `-h`, `-a`, `-e`, or `-c` alone searches all weapons
+          - **Fuzzy search**: Typo-tolerant multi-term search with prefix priority
+          - **Prefix ranking**: Weapons starting with search term ranked higher
+          
+          ### Source Filter Examples
+          - `-s se` → Salvation's Edge
+          - `-s vog` → Vault of Glass
+          - `-s crotas` → Crota's End
+          - `-s trials` → Trials of Osiris
+          - `-s nightfall` → Nightfall
+
+          ### Launcher & Window
+          - Anti-Champion icons show whether a weapon counters Barrier, Overload, or Unstoppable Champions
+          - Accelerated Assault icons appear in weapon results
+          - Use `Prefer PWA Mode` in the tray menu to choose between app-style windows and browser tabs
+          - A startup screen shows boot progress and automatically retries if the launcher cannot start
+          - The system tray menu includes a dedicated `Show` action to bring the launcher into view
+          - Weapon links open reliably in the user's preferred browser
+          
+          ### Auto-Updater
+          - Automatic update check on startup
+          - Manual "Check for Updates" from system tray menu
+          - One-click download and automatic installation
+          - Shows current version in tray tooltip
+          - Downloads are verified before installation and the previous version is restored if an update fails
+          - The update screen provides clear progress and error feedback
+          
+          ### Auto Refresh
+          - Automatically checks for weapon database updates when app comes to foreground
+          - Toggle on/off via "Auto Refresh Weapon List" in system tray menu
+
+          ### Installation
+          1. Download `GodrollLauncher-v${{ steps.new_version.outputs.NEW_VERSION }}.zip`
+          2. Extract to your preferred location
+          3. Run `GodrollLauncher.exe`
+          
+          ### Keyboard Shortcuts
+          - The global shortcut can be changed from the launcher or system tray
+
+          | Shortcut | Action |
+          |----------|--------|
+          | `Alt+G` | Toggle launcher (global) |
+          | `ESC` | Clear search / Close |
+          | `F5` | Reload weapon data |
+          | `↑/↓` | Navigate results |
+          | `Enter` | Open weapon |
+          | `Middle-click` | Open weapon (keep launcher open) |
+        files: |
+          GodrollLauncher-v${{ steps.new_version.outputs.NEW_VERSION }}.zip
+          GodrollLauncher-v${{ steps.new_version.outputs.NEW_VERSION }}.zip.sha256
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GODROLLDEV_RELEASE_TOKEN }}
+
+    - name: Upload artifact (for PRs)
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: GodrollLauncher-v${{ steps.new_version.outputs.NEW_VERSION }}
+        path: build/deploy/
+        retention-days: 7

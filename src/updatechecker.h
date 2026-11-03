@@ -1,0 +1,113 @@
+#ifndef UPDATECHECKER_H
+#define UPDATECHECKER_H
+
+#include <QObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QString>
+#include <QUrl>
+#include <QFile>
+#include <QFutureWatcher>
+
+class UpdateChecker : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString currentVersion READ currentVersion CONSTANT)
+    Q_PROPERTY(QString latestVersion READ latestVersion NOTIFY updateInfoChanged)
+    Q_PROPERTY(QString releaseNotes READ releaseNotes NOTIFY updateInfoChanged)
+    Q_PROPERTY(QString downloadUrl READ downloadUrl NOTIFY updateInfoChanged)
+    Q_PROPERTY(bool updateAvailable READ updateAvailable NOTIFY updateInfoChanged)
+    Q_PROPERTY(bool checking READ checking NOTIFY checkingChanged)
+    Q_PROPERTY(QString checkError READ checkError NOTIFY checkingChanged)
+    Q_PROPERTY(bool downloading READ downloading NOTIFY downloadingChanged)
+    Q_PROPERTY(int downloadProgress READ downloadProgress NOTIFY downloadProgressChanged)
+    Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+    Q_PROPERTY(QString updatedToVersion READ updatedToVersion NOTIFY updatedToVersionChanged)
+
+public:
+    explicit UpdateChecker(QObject *parent = nullptr,
+                           QNetworkAccessManager *networkManager = nullptr,
+                           int checkTimeoutMs = 15000);
+    
+    QString currentVersion() const { return m_currentVersion; }
+    QString latestVersion() const { return m_latestVersion; }
+    QString releaseNotes() const { return m_releaseNotes; }
+    QString downloadUrl() const { return m_downloadUrl; }
+    bool updateAvailable() const { return m_updateAvailable; }
+    bool checking() const { return m_checking; }
+    QString checkError() const { return m_checkError; }
+    bool downloading() const { return m_downloading; }
+    int downloadProgress() const { return m_downloadProgress; }
+    QString statusText() const { return m_statusText; }
+    QString updatedToVersion() const { return m_updatedToVersion; }
+    
+    Q_INVOKABLE void checkForUpdates();
+    Q_INVOKABLE void checkForUpdatesIfNeeded();  // Check only if 4+ hours since last check
+    Q_INVOKABLE void openDownloadPage();
+    Q_INVOKABLE void skipVersion(const QString &version);
+    Q_INVOKABLE bool isVersionSkipped(const QString &version);
+    Q_INVOKABLE void downloadAndInstall();
+    Q_INVOKABLE void clearUpdateNotification();
+
+signals:
+    void updateInfoChanged();
+    void checkingChanged();
+    void downloadingChanged();
+    void downloadProgressChanged();
+    void statusTextChanged();
+    void updatedToVersionChanged();
+    void updateCheckComplete(bool updateAvailable);
+    void updateCheckFailed(const QString &error);
+    void downloadComplete(const QString &filePath);
+    void downloadFailed(const QString &error);
+    void justUpdated(const QString &version);
+
+private slots:
+    void onNetworkReply(QNetworkReply *reply);
+    void onDownloadReadyRead();
+    void onDownloadProgress(qint64 bytesReceived, qint64 bytesTotal);
+    void onChecksumFinished();
+    void onDownloadFinished();
+    void onExtractionFinished();
+
+private:
+    bool isNewerVersion(const QString &latest, const QString &current) const;
+    void startUpdateDownload();
+    void launchInstallerAndQuit(const QString &installerPath);
+    void startAsyncExtraction(const QString &zipPath);
+    static bool extractZipAndReplace(const QString &zipPath, const QString &appDir,
+                                     const QString &appExe, qint64 launcherPid);
+    void setStatusText(const QString &text);
+    void failCheck(const QString &message);
+    static QString checkFailureMessage(QNetworkReply *reply);
+    
+    QNetworkAccessManager *m_networkManager;
+    QNetworkReply *m_checkReply = nullptr;
+    int m_checkTimeoutMs;
+    QString m_checkError;
+    QNetworkReply *m_checksumReply = nullptr;
+    QNetworkReply *m_downloadReply = nullptr;
+    QFile *m_downloadFile = nullptr;
+    QString m_currentVersion;
+    QString m_latestVersion;
+    QString m_releaseNotes;
+    QString m_downloadUrl;
+    QString m_checksumUrl;
+    QString m_releaseAssetSha256;
+    QString m_downloadSha256;
+    QString m_htmlUrl;  // GitHub release page URL
+    QString m_downloadedFilePath;
+    QString m_updatedToVersion;
+    QString m_statusText;
+    bool m_updateAvailable = false;
+    bool m_checking = false;
+    bool m_downloading = false;
+    int m_downloadProgress = 0;
+    qint64 m_lastCheckTime = 0;  // Unix timestamp of last update check
+    
+    static const QString UPDATE_API_URL;
+    
+    QFutureWatcher<bool> *m_extractionWatcher = nullptr;
+};
+
+#endif // UPDATECHECKER_H
